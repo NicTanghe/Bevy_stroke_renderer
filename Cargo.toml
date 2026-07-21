@@ -1,0 +1,35 @@
+[package]
+name = "hamerons_stroke_render"
+version = "0.1.0"
+edition = "2024"
+description = "Low-latency GPU stroke rendering for Hamerons"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[features]
+webgl = ["bevy_sprite_render/webgl"]
+webgpu = ["bevy_sprite_render/webgpu"]
+
+[dependencies]
+bevy_app = { path = "../../Hamerons_bevy/crates/bevy_app", version = "0.20.0-dev" }
+bevy_asset = { path = "../../Hamerons_bevy/crates/bevy_asset", version = "0.20.0-dev" }
+bevy_camera = { path = "../../Hamerons_bevy/crates/bevy_camera", version = "0.20.0-dev" }
+bevy_core_pipeline = { path = "../../Hamerons_bevy/crates/bevy_core_pipeline", version = "0.20.0-dev" }
+bevy_ecs = { path = "../../Hamerons_bevy/crates/bevy_ecs", version = "0.20.0-dev" }
+bevy_input = { path = "../../Hamerons_bevy/crates/bevy_input", version = "0.20.0-dev", features = ["pen"] }
+bevy_math = { path = "../../Hamerons_bevy/crates/bevy_math", version = "0.20.0-dev" }
+bevy_render = { path = "../../Hamerons_bevy/crates/bevy_render", version = "0.20.0-dev" }
+bevy_shader = { path = "../../Hamerons_bevy/crates/bevy_shader", version = "0.20.0-dev" }
+bevy_sprite_render = { path = "../../Hamerons_bevy/crates/bevy_sprite_render", version = "0.20.0-dev" }
+bevy_transform = { path = "../../Hamerons_bevy/crates/bevy_transform", version = "0.20.0-dev" }
+bevy_window = { path = "../../Hamerons_bevy/crates/bevy_window", version = "0.20.0-dev" }
+
+bytemuck = { version = "1", features = ["derive", "must_cast"] }
+png = "0.18.1"
+ron = "0.12.2"
+serde = { version = "1", features = ["derive"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+zip = { version = "8.6.0", default-features = false }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
