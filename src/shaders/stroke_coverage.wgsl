@@ -197,22 +197,31 @@ fn vertex(
     );
 }
 
+fn primitive_sample(in: VertexOutput) -> geometry::StrokeSample {
+    let document_pixel = floor(in.world_position) + vec2(0.5);
+    if in.shape == 1u {
+        return geometry::segment_exposed_cap_sample(document_pixel, in.segment_index);
+    }
+    return geometry::segment_body_sample(document_pixel, in.segment_index);
+}
+
 @fragment
-fn fragment_rgba(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_amount(in: VertexOutput) -> @location(0) vec4<f32> {
     let segment = geometry::stroke_segments[in.segment_index];
     let layer = canvas_layers[segment.layer];
     if layer.visible == 0u || layer.opacity <= 0.0 {
-        return vec4(0.0);
+        discard;
     }
 
     // Persistent tiles own integer document pixels. Evaluating the live mask
     // at that same center makes the stroke invariant across the handoff.
-    let document_pixel = floor(in.world_position) + vec2(0.5);
-    var amount = geometry::segment_body_amount(document_pixel, in.segment_index);
-    if in.shape == 1u {
-        amount = geometry::segment_cap_amount(document_pixel, in.segment_index);
+    let sample = primitive_sample(in);
+    if sample.coverage <= 0.0 {
+        discard;
     }
-    // Layer opacity belongs to the resolved layer, after this stroke has been
-    // composed with the cached strokes beneath it.
-    return rgba_materials[segment.material].color * clamp(amount, 0.0, 1.0);
+    // MAX blending unions premultiplied deposition directly. A later weak
+    // sample can never punch a bright hole into an earlier strong overlap.
+    // Layer opacity belongs to the resolved layer after stroke composition.
+    return rgba_materials[segment.material].color
+        * geometry::stroke_sample_amount(sample);
 }

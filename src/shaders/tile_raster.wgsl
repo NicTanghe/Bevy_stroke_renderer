@@ -29,8 +29,10 @@ struct ReplayStroke {
 @group(0) @binding(6) var<storage, read_write> tile_pixels: array<u32>;
 
 // One invocation owns one destination pixel. It replays strokes in document
-// order and takes Max coverage across every segment of each stroke before a
-// single deposition. That prevents translucent joins from darkening.
+// order and takes the maximum premultiplied amount across the continuous
+// bodies and exposed join/end caps of each stroke. This is the same monotonic
+// union as the live render pass: overlap never darkens through accumulation,
+// and a weak sample can never replace stronger ink already at that pixel.
 @compute @workgroup_size(8, 8, 1)
 fn rasterize_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let job = tile_jobs[id.z];
@@ -54,8 +56,13 @@ fn rasterize_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         var amount = 0.0;
         for (var segment_offset = 0u; segment_offset < replay.segment_count; segment_offset += 1u) {
             let segment_index = replay_segment_indices[replay.segment_index_start + segment_offset];
-            amount = max(amount, geometry::segment_body_amount(pixel, segment_index));
-            amount = max(amount, geometry::segment_cap_amount(pixel, segment_index));
+            let body_sample = geometry::segment_body_sample(pixel, segment_index);
+            let cap_sample = geometry::segment_exposed_cap_sample(
+                pixel,
+                segment_index,
+            );
+            amount = max(amount, geometry::stroke_sample_amount(body_sample));
+            amount = max(amount, geometry::stroke_sample_amount(cap_sample));
         }
 
         let material = rgba_materials[replay.material].color;

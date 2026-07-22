@@ -17,6 +17,13 @@ struct StrokeSegment {
     layer: u32,
 }
 
+struct StrokeSample {
+    coverage: f32,
+    flow: f32,
+}
+
+const INVALID_STROKE_DISTANCE: f32 = 1.0e30;
+
 @group(0) @binding(0) var<storage, read> stroke_points: array<StrokePoint>;
 @group(0) @binding(1) var<storage, read> stroke_segments: array<StrokeSegment>;
 
@@ -39,7 +46,14 @@ fn point_major_axis(point: StrokePoint) -> vec2<f32> {
     return rotate_vector(major_axis, point.twist_radians);
 }
 
-fn ellipse_amount(pixel: vec2<f32>, point: StrokePoint) -> f32 {
+fn empty_stroke_sample() -> StrokeSample {
+    return StrokeSample(
+        0.0,
+        0.0,
+    );
+}
+
+fn ellipse_sample(pixel: vec2<f32>, point: StrokePoint) -> StrokeSample {
     let minor_radius = max(point.half_width, 0.0001);
     let major_radius = minor_radius * max(point.aspect_ratio, 1.0);
     let major_axis = point_major_axis(point);
@@ -51,7 +65,14 @@ fn ellipse_amount(pixel: vec2<f32>, point: StrokePoint) -> f32 {
     ));
     let signed_distance = (normalized_distance - 1.0) * minor_radius;
     let coverage = clamp(0.5 - signed_distance, 0.0, 1.0);
-    return coverage * clamp(point.flow, 0.0, 1.0);
+    return StrokeSample(
+        coverage,
+        clamp(point.flow, 0.0, 1.0),
+    );
+}
+
+fn stroke_sample_amount(sample: StrokeSample) -> f32 {
+    return sample.coverage * sample.flow;
 }
 
 fn interpolate_ellipse_axis(
@@ -132,42 +153,70 @@ fn ellipse_metric_projection(
     return dot(metric_offset, metric_delta) / denominator;
 }
 
-fn segment_body_amount(pixel: vec2<f32>, segment_index: u32) -> f32 {
+fn segment_body_projection(pixel: vec2<f32>, segment_index: u32) -> f32 {
     let segment = stroke_segments[segment_index];
     let point_a = stroke_points[segment.start];
     let point_b = stroke_points[segment.end];
     let delta = point_b.position - point_a.position;
     let length_squared = dot(delta, delta);
     if length_squared <= 0.000001 {
-        return 0.0;
+        return INVALID_STROKE_DISTANCE;
     }
 
-    // Find the closest center along the segment in the brush ellipse's own
-    // metric. A Euclidean projection plus a pair of metric refinements is
-    // exact for a constant footprint and stable for the densely resampled,
-    // varying footprints used by the input path.
     var amount = clamp(dot(pixel - point_a.position, delta) / length_squared, 0.0, 1.0);
     for (var iteration = 0u; iteration < 2u; iteration += 1u) {
-        let point = interpolate_stroke_point(point_a, point_b, amount);
-        amount = clamp(
-            ellipse_metric_projection(pixel, point_a.position, delta, point),
-            0.0,
-            1.0,
-        );
+        let point = interpolate_stroke_point(point_a, point_b, clamp(amount, 0.0, 1.0));
+        amount = ellipse_metric_projection(pixel, point_a.position, delta, point);
     }
-    // Endpoint regions belong to the exact ellipse caps. Keeping the body to
-    // the open interval prevents a rotated ellipse's support radius from
-    // becoming a triangular corner at a sample boundary.
-    if amount <= 0.0 || amount >= 1.0 {
-        return 0.0;
-    }
-    return ellipse_amount(pixel, interpolate_stroke_point(point_a, point_b, amount));
+    return amount;
 }
 
-fn segment_cap_amount(pixel: vec2<f32>, segment_index: u32) -> f32 {
+fn segment_body_sample(pixel: vec2<f32>, segment_index: u32) -> StrokeSample {
     let segment = stroke_segments[segment_index];
-    // Each segment contributes its end point once; the initial zero-length
-    // segment contributes the first point. MAX-union compositing makes full
-    // internal caps safe and lets them close turns without miter geometry.
-    return ellipse_amount(pixel, stroke_points[segment.end]);
+    let amount = segment_body_projection(pixel, segment_index);
+    if amount < 0.0 || amount > 1.0 {
+        return empty_stroke_sample();
+    }
+    let point_a = stroke_points[segment.start];
+    let point_b = stroke_points[segment.end];
+    return ellipse_sample(pixel, interpolate_stroke_point(point_a, point_b, amount));
+}
+
+fn segment_cap_sample(pixel: vec2<f32>, segment_index: u32) -> StrokeSample {
+    let segment = stroke_segments[segment_index];
+    return ellipse_sample(pixel, stroke_points[segment.end]);
+}
+
+fn segment_exposed_cap_sample(pixel: vec2<f32>, segment_index: u32) -> StrokeSample {
+    let segment = stroke_segments[segment_index];
+    let cap_sample = segment_cap_sample(pixel, segment_index);
+    if cap_sample.coverage <= 0.0 {
+        return empty_stroke_sample();
+    }
+
+    // A cap owns only the angular region outside its incoming and outgoing
+    // centerline half-planes. This leaves a rear cap at stroke start, the outer
+    // wedge at a turn, and a forward cap at stroke end. It never leaves a full
+    // internal ellipse behind to stamp a pressure value across later segments.
+    let current_start = stroke_points[segment.start].position;
+    let current_end = stroke_points[segment.end].position;
+    if distance(current_start, current_end) > 0.0001
+        && segment_body_projection(pixel, segment_index) <= 1.0
+    {
+        return empty_stroke_sample();
+    }
+    let next_index = segment_index + 1u;
+    if next_index < arrayLength(&stroke_segments) {
+        let next_segment = stroke_segments[next_index];
+        if next_segment.start == segment.end {
+            let next_start = stroke_points[next_segment.start].position;
+            let next_end = stroke_points[next_segment.end].position;
+            if distance(next_start, next_end) > 0.0001
+                && segment_body_projection(pixel, next_index) >= 0.0
+            {
+                return empty_stroke_sample();
+            }
+        }
+    }
+    return cap_sample;
 }

@@ -1323,20 +1323,21 @@ fn rasterize_krita_tile(
                 );
                 let mut amount = 0.0f32;
                 for segment_index in stroke.first_segment..segment_end {
-                    amount = amount.max(krita_segment_body_amount(
+                    let body_sample = krita_segment_body_sample(
                         document_point,
                         segment_index,
                         &archive.segments,
                         &archive.points,
-                    ));
-                    amount = amount.max(krita_segment_cap_amount(
+                    );
+                    let cap_sample = krita_segment_exposed_cap_sample(
                         document_point,
                         segment_index,
                         &archive.segments,
                         &archive.points,
-                    ));
+                    );
+                    amount = amount.max(body_sample.amount()).max(cap_sample.amount());
                 }
-                amount = amount.clamp(0.0, 1.0);
+                let amount = amount.clamp(0.0, 1.0);
                 let index = (local_y * KRITA_TILE_SIZE + local_x) as usize;
                 let destination = &mut pixels[index];
                 if stroke.brush.deposition == DepositionMode::Erase as u8 {
@@ -1366,7 +1367,24 @@ fn krita_point_major_axis(point: ArchivePoint) -> Vec2 {
     )
 }
 
-fn krita_ellipse_amount(pixel: Vec2, point: ArchivePoint) -> f32 {
+#[derive(Clone, Copy, Debug)]
+struct KritaStrokeSample {
+    coverage: f32,
+    flow: f32,
+}
+
+impl KritaStrokeSample {
+    const EMPTY: Self = Self {
+        coverage: 0.0,
+        flow: 0.0,
+    };
+
+    fn amount(self) -> f32 {
+        self.coverage * self.flow
+    }
+}
+
+fn krita_ellipse_sample(pixel: Vec2, point: ArchivePoint) -> KritaStrokeSample {
     let minor_radius = point.half_width.max(0.0001);
     let major_radius = minor_radius * point.aspect_ratio.max(1.0);
     let major_axis = krita_point_major_axis(point);
@@ -1379,7 +1397,10 @@ fn krita_ellipse_amount(pixel: Vec2, point: ArchivePoint) -> f32 {
     .length();
     let signed_distance = (normalized_distance - 1.0) * minor_radius;
     let coverage = (0.5 - signed_distance).clamp(0.0, 1.0);
-    coverage * point.flow.clamp(0.0, 1.0)
+    KritaStrokeSample {
+        coverage,
+        flow: point.flow.clamp(0.0, 1.0),
+    }
 }
 
 fn krita_interpolate_ellipse_axis(from: Vec2, to: Vec2, amount: f32) -> Vec2 {
@@ -1439,7 +1460,7 @@ fn krita_ellipse_metric_projection(
     metric_offset.dot(metric_delta) / denominator
 }
 
-fn krita_segment_body_amount(
+fn krita_segment_body_projection(
     pixel: Vec2,
     segment_index: u32,
     segments: &[ArchiveSegment],
@@ -1453,30 +1474,108 @@ fn krita_segment_body_amount(
     let delta = position_b - position_a;
     let length_squared = delta.length_squared();
     if length_squared <= 0.000_001 {
-        return 0.0;
+        return f32::MAX;
     }
     let mut amount = ((pixel - position_a).dot(delta) / length_squared).clamp(0.0, 1.0);
     for _ in 0..2 {
-        let point = krita_interpolate_stroke_point(point_a, point_b, amount);
-        amount = krita_ellipse_metric_projection(pixel, position_a, delta, point).clamp(0.0, 1.0);
+        let point = krita_interpolate_stroke_point(point_a, point_b, amount.clamp(0.0, 1.0));
+        amount = krita_ellipse_metric_projection(pixel, position_a, delta, point);
     }
-    if amount <= 0.0 || amount >= 1.0 {
-        return 0.0;
+    amount
+}
+
+fn krita_segment_body_sample(
+    pixel: Vec2,
+    segment_index: u32,
+    segments: &[ArchiveSegment],
+    points: &[ArchivePoint],
+) -> KritaStrokeSample {
+    let amount = krita_segment_body_projection(pixel, segment_index, segments, points);
+    if !(0.0..=1.0).contains(&amount) {
+        return KritaStrokeSample::EMPTY;
     }
-    krita_ellipse_amount(
+    let segment = segments[segment_index as usize];
+    let point_a = points[segment.start as usize];
+    let point_b = points[segment.end as usize];
+    krita_ellipse_sample(
         pixel,
         krita_interpolate_stroke_point(point_a, point_b, amount),
     )
 }
 
+fn krita_segment_cap_sample(
+    pixel: Vec2,
+    segment_index: u32,
+    segments: &[ArchiveSegment],
+    points: &[ArchivePoint],
+) -> KritaStrokeSample {
+    let segment = segments[segment_index as usize];
+    krita_ellipse_sample(pixel, points[segment.end as usize])
+}
+
+fn krita_segment_exposed_cap_sample(
+    pixel: Vec2,
+    segment_index: u32,
+    segments: &[ArchiveSegment],
+    points: &[ArchivePoint],
+) -> KritaStrokeSample {
+    let cap_sample = krita_segment_cap_sample(pixel, segment_index, segments, points);
+    if cap_sample.coverage <= 0.0 {
+        return KritaStrokeSample::EMPTY;
+    }
+
+    let segment = segments[segment_index as usize];
+    let start = Vec2::from_array(points[segment.start as usize].position);
+    let end = Vec2::from_array(points[segment.end as usize].position);
+    if start.distance(end) > 0.0001
+        && krita_segment_body_projection(pixel, segment_index, segments, points) <= 1.0
+    {
+        return KritaStrokeSample::EMPTY;
+    }
+
+    let next_index = segment_index as usize + 1;
+    if let Some(next) = segments.get(next_index)
+        && next.start == segment.end
+    {
+        let next_start = Vec2::from_array(points[next.start as usize].position);
+        let next_end = Vec2::from_array(points[next.end as usize].position);
+        if next_start.distance(next_end) > 0.0001
+            && krita_segment_body_projection(pixel, next_index as u32, segments, points) >= 0.0
+        {
+            return KritaStrokeSample::EMPTY;
+        }
+    }
+    cap_sample
+}
+
+#[cfg(test)]
+fn krita_segment_body_amount(
+    pixel: Vec2,
+    segment_index: u32,
+    segments: &[ArchiveSegment],
+    points: &[ArchivePoint],
+) -> f32 {
+    krita_segment_body_sample(pixel, segment_index, segments, points).amount()
+}
+
+#[cfg(test)]
 fn krita_segment_cap_amount(
     pixel: Vec2,
     segment_index: u32,
     segments: &[ArchiveSegment],
     points: &[ArchivePoint],
 ) -> f32 {
-    let segment = segments[segment_index as usize];
-    krita_ellipse_amount(pixel, points[segment.end as usize])
+    krita_segment_cap_sample(pixel, segment_index, segments, points).amount()
+}
+
+#[cfg(test)]
+fn krita_segment_exposed_cap_amount(
+    pixel: Vec2,
+    segment_index: u32,
+    segments: &[ArchiveSegment],
+    points: &[ArchivePoint],
+) -> f32 {
+    krita_segment_exposed_cap_sample(pixel, segment_index, segments, points).amount()
 }
 
 fn paint_device_bytes(tiles: &BTreeMap<(u32, u32), Vec<[f32; 4]>>) -> Vec<u8> {
@@ -1727,6 +1826,14 @@ mod tests {
             krita_segment_cap_amount(Vec2::new(10.0, 2.0), 0, &straight_segments, &straight),
             0.25
         );
+        assert_eq!(
+            krita_segment_cap_amount(Vec2::new(9.5, 2.0), 0, &straight_segments, &straight),
+            0.25
+        );
+        assert_eq!(
+            krita_segment_cap_amount(Vec2::new(10.5, 2.0), 0, &straight_segments, &straight),
+            0.25
+        );
 
         let corner = [
             raster_point(0.0, 0.0),
@@ -1734,7 +1841,8 @@ mod tests {
             raster_point(10.0, 10.0),
         ];
         assert!(
-            krita_segment_cap_amount(Vec2::new(11.0, -1.0), 0, &straight_segments, &corner) > 0.24
+            krita_segment_exposed_cap_amount(Vec2::new(11.0, -1.0), 0, &straight_segments, &corner,)
+                > 0.24
         );
         let outside_corner =
             krita_segment_body_amount(Vec2::new(11.0, -1.0), 0, &straight_segments, &corner).max(
@@ -1774,6 +1882,107 @@ mod tests {
         assert!(
             krita_segment_body_amount(Vec2::new(10.0, 6.5), 0, &tilted_segments, &tilted,) > 0.15
         );
+    }
+
+    #[test]
+    fn smooth_join_caps_do_not_stamp_interpolated_flow() {
+        let varying_point = |x, flow| ArchivePoint {
+            flow,
+            ..raster_point(x, 0.0)
+        };
+        let points = [
+            varying_point(0.0, 0.1),
+            varying_point(10.0, 0.5),
+            varying_point(20.0, 0.9),
+        ];
+        let segments = [
+            ArchiveSegment {
+                start: 0,
+                end: 1,
+                ..Default::default()
+            },
+            ArchiveSegment {
+                start: 1,
+                end: 2,
+                ..Default::default()
+            },
+        ];
+        let stroke_amount = |pixel| {
+            (0..segments.len()).fold(0.0f32, |amount, segment_index| {
+                let body =
+                    krita_segment_body_sample(pixel, segment_index as u32, &segments, &points);
+                let cap = krita_segment_exposed_cap_sample(
+                    pixel,
+                    segment_index as u32,
+                    &segments,
+                    &points,
+                );
+                amount.max(body.amount()).max(cap.amount())
+            })
+        };
+
+        // A full middle ellipse would flatten this range to 0.5. Restricting
+        // that join cap to its exposed angular wedge preserves interpolation.
+        assert!((stroke_amount(Vec2::new(9.0, 0.0)) - 0.46).abs() < 0.0001);
+        assert!((stroke_amount(Vec2::new(10.0, 0.0)) - 0.5).abs() < 0.0001);
+        assert!((stroke_amount(Vec2::new(11.0, 0.0)) - 0.54).abs() < 0.0001);
+    }
+
+    #[test]
+    fn low_flow_tip_and_overlap_cannot_cut_a_hole_in_existing_ink() {
+        let varying_point = |x, y, flow| ArchivePoint {
+            position: [x, y],
+            flow,
+            ..raster_point(x, y)
+        };
+        let points = [
+            varying_point(0.0, 0.0, 1.0),
+            varying_point(10.0, 0.0, 1.0),
+            varying_point(11.0, 0.0, 0.1),
+            varying_point(0.0, 0.0, 0.1),
+            varying_point(10.0, 0.0, 0.1),
+        ];
+        let segments = [
+            ArchiveSegment {
+                start: 0,
+                end: 1,
+                ..Default::default()
+            },
+            ArchiveSegment {
+                start: 1,
+                end: 2,
+                ..Default::default()
+            },
+            ArchiveSegment {
+                start: 3,
+                end: 4,
+                ..Default::default()
+            },
+        ];
+        let stroke_amount = |pixel, included: core::ops::Range<usize>| {
+            let mut amount = 0.0f32;
+            for segment_index in included {
+                let body =
+                    krita_segment_body_sample(pixel, segment_index as u32, &segments, &points);
+                let cap = krita_segment_exposed_cap_sample(
+                    pixel,
+                    segment_index as u32,
+                    &segments,
+                    &points,
+                );
+                amount = amount.max(body.amount()).max(cap.amount());
+            }
+            amount
+        };
+
+        // The last low-flow segment owns the whole tip cross-section. The
+        // nearby older cap must not wrap a dark ring around its lighter center.
+        assert!((stroke_amount(Vec2::new(11.0, 0.0), 0..2) - 0.1).abs() < 0.0001);
+        assert!((stroke_amount(Vec2::new(11.5, 0.0), 0..2) - 0.1).abs() < 0.0001);
+
+        // At a real path overlap, a later weak branch cannot replace a body
+        // contribution that already deposited more ink at the same pixel.
+        assert!((stroke_amount(Vec2::new(5.0, 0.0), 0..3) - 1.0).abs() < 0.0001);
     }
 
     #[test]

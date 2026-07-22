@@ -629,7 +629,7 @@ fn prepare_live_stroke_masks(
                 layer_capacity: requested_layer_capacity,
                 stroke_masks: create_live_texture_array(
                     &device,
-                    "Hamerons live per-stroke union masks",
+                    "Hamerons live per-stroke amount masks",
                     width,
                     height,
                     requested_stroke_capacity,
@@ -863,7 +863,7 @@ fn init_stroke_pipeline(
     let coverage_shader =
         asset_server.load("embedded://hamerons_stroke_render/shaders/stroke_coverage.wgsl");
     let mask_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("Hamerons live stroke union-mask pipeline".into()),
+        label: Some("Hamerons live stroke amount-union pipeline".into()),
         layout: vec![layout.0.clone(), mesh_pipeline.view_layout.clone()],
         vertex: VertexState {
             shader: coverage_shader.clone(),
@@ -874,7 +874,7 @@ fn init_stroke_pipeline(
         },
         fragment: Some(FragmentState {
             shader: coverage_shader,
-            entry_point: Some("fragment_rgba".into()),
+            entry_point: Some("fragment_amount".into()),
             shader_defs: Vec::new(),
             targets: vec![Some(ColorTargetState {
                 format: LIVE_MASK_FORMAT,
@@ -1171,7 +1171,7 @@ fn rasterize_live_stroke_masks(
     if buffers.overlay_ranges.is_empty() {
         return;
     }
-    let (Some(render_pipeline), Some(stroke_bind_group)) = (
+    let (Some(mask_pipeline), Some(stroke_bind_group)) = (
         pipeline_cache.get_render_pipeline(pipeline.pipeline),
         buffers.bind_group.as_ref(),
     ) else {
@@ -1188,11 +1188,11 @@ fn rasterize_live_stroke_masks(
             .take(mask.stroke_masks.layer_views.len())
             .enumerate()
         {
-            let mut pass =
+            let mut mask_pass =
                 render_context
                     .command_encoder()
                     .begin_render_pass(&RenderPassDescriptor {
-                        label: Some("Hamerons live stroke union-mask pass"),
+                        label: Some("Hamerons live stroke amount-union pass"),
                         color_attachments: &[Some(RenderPassColorAttachment {
                             view: &mask.stroke_masks.layer_views[mask_layer],
                             depth_slice: None,
@@ -1207,11 +1207,11 @@ fn rasterize_live_stroke_masks(
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-            pass.set_pipeline(render_pipeline);
-            pass.set_bind_group(0, stroke_bind_group, &[]);
-            pass.set_bind_group(1, &view_bind_group.value, &[view_uniform.offset]);
-            pass.draw(0..6, segment_range.clone());
-            pass.draw(6..12, segment_range.clone());
+            mask_pass.set_pipeline(mask_pipeline);
+            mask_pass.set_bind_group(0, stroke_bind_group, &[]);
+            mask_pass.set_bind_group(1, &view_bind_group.value, &[view_uniform.offset]);
+            mask_pass.draw(0..6, segment_range.clone());
+            mask_pass.draw(6..12, segment_range.clone());
         }
     }
 }
