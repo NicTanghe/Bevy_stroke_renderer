@@ -28,6 +28,10 @@ struct ReplayStroke {
 @group(0) @binding(5) var<storage, read> replay_segment_indices: array<u32>;
 @group(0) @binding(6) var<storage, read_write> tile_pixels: array<u32>;
 
+fn rgba8_checkpoint(value: vec4<f32>) -> vec4<f32> {
+    return unpack4x8unorm(pack4x8unorm(clamp(value, vec4(0.0), vec4(1.0))));
+}
+
 // One invocation owns one destination pixel. It replays strokes in document
 // order and takes Max coverage across every segment of each stroke before a
 // single deposition. That prevents translucent joins from darkening.
@@ -66,6 +70,10 @@ fn rasterize_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             let source = material * clamp(amount, 0.0, 1.0);
             destination = source + destination * (1.0 - source.a);
         }
+        // The live path starts each new stroke from the completed RGBA8 tile.
+        // Use the same whole-stroke checkpoint during replay so a stroke does
+        // not change color when it moves from the live overlay into this tile.
+        destination = rgba8_checkpoint(destination);
     }
 
     let tile_area = job.tile_size * job.tile_size;

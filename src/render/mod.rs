@@ -60,9 +60,10 @@ use crate::{
 // Live coverage is premultiplied before it is resolved over the cached layer.
 // An 8-bit mask cannot represent low-alpha dark colors accurately: its RGB
 // channels round to zero while alpha remains nonzero, effectively turning the
-// source into translucent black. Keep the source mask in floating point, then
-// quantize the completed layer exactly once so it matches the persistent RGBA8
-// tile shown after the stroke retires.
+// source into translucent black. Keep each stroke mask in floating point, then
+// quantize only after that whole stroke is resolved. The persistent tile replay
+// uses the same per-stroke RGBA8 checkpoints, so retiring a live stroke cannot
+// change its color.
 const LIVE_MASK_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 const RESOLVED_LAYER_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 
@@ -1520,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_translucent_live_ink_quantizes_only_after_resolve() {
+    fn dark_translucent_live_ink_quantizes_only_after_each_stroke_resolves() {
         fn unorm8(value: f32) -> f32 {
             (value.clamp(0.0, 1.0) * 255.0).round() / 255.0
         }
@@ -1530,8 +1531,8 @@ mod tests {
         let source = ink * amount;
         let cached_ink = ink.map(unorm8);
 
-        // Resolving in floating point and quantizing the completed layer keeps
-        // an opaque patch unchanged, matching the persistent tile handoff.
+        // Resolving the whole stroke in floating point before its RGBA8
+        // checkpoint keeps an opaque patch unchanged.
         let resolved = source + cached_ink * (1.0 - source.w);
         let live_result = resolved.map(unorm8);
         assert_eq!(live_result, cached_ink);
@@ -1545,5 +1546,36 @@ mod tests {
 
         assert_eq!(LIVE_MASK_FORMAT, TextureFormat::Rgba16Float);
         assert_eq!(RESOLVED_LAYER_FORMAT, TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn live_handoff_matches_persistent_per_stroke_checkpoints() {
+        fn unorm8(value: f32) -> f32 {
+            (value.clamp(0.0, 1.0) * 255.0).round() / 255.0
+        }
+
+        fn deposit(destination: Vec4, source: Vec4) -> Vec4 {
+            (source + destination * (1.0 - source.w)).map(unorm8)
+        }
+
+        let ink = Vec4::new(0.015, 0.02, 0.03, 1.0);
+        let source = ink * 0.13;
+
+        // The live path begins with the completed RGBA8 tile, then resolves
+        // the current stroke. Persistent replay must checkpoint at that same
+        // whole-stroke boundary before it continues with the current stroke.
+        let cached_after_first_stroke = deposit(Vec4::ZERO, source);
+        let live_after_second_stroke = deposit(cached_after_first_stroke, source);
+
+        let mut persistent_replay = Vec4::ZERO;
+        for stroke in [source, source] {
+            persistent_replay = deposit(persistent_replay, stroke);
+        }
+        assert_eq!(live_after_second_stroke, persistent_replay);
+
+        // Quantizing only once after replaying every stroke creates a different
+        // color and was the visible change when the live stroke retired.
+        let float_replay = source + source * (1.0 - source.w);
+        assert_ne!(float_replay.map(unorm8), live_after_second_stroke);
     }
 }

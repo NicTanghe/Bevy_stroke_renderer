@@ -1217,6 +1217,12 @@ struct KritaLayerRaster {
     tiles: BTreeMap<(u32, u32), Vec<[f32; 4]>>,
 }
 
+fn rgba8_checkpoint(pixel: &mut [f32; 4]) {
+    for channel in pixel {
+        *channel = (channel.clamp(0.0, 1.0) * 255.0).round() / 255.0;
+    }
+}
+
 fn rasterize_krita_layers(archive: &ArchiveDocument) -> Vec<KritaLayerRaster> {
     let materials: HashMap<_, _> = archive
         .materials
@@ -1341,7 +1347,7 @@ fn rasterize_krita_tile(
                 let destination = &mut pixels[index];
                 if stroke.brush.deposition == DepositionMode::Erase as u8 {
                     let remaining = 1.0 - (amount * material[3]).clamp(0.0, 1.0);
-                    for channel in destination {
+                    for channel in &mut *destination {
                         *channel *= remaining;
                     }
                 } else {
@@ -1351,6 +1357,9 @@ fn rasterize_krita_tile(
                             source[channel] + destination[channel] * (1.0 - source[3]);
                     }
                 }
+                // Match the GPU tile replay and the live-to-completed handoff:
+                // one RGBA8 checkpoint after each complete stroke deposition.
+                rgba8_checkpoint(destination);
             }
         }
     }

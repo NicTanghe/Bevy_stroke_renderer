@@ -28,6 +28,10 @@ const FULLSCREEN_TRIANGLE: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
     vec2(-1.0,  3.0),
 );
 
+fn rgba8_checkpoint(value: vec4<f32>) -> vec4<f32> {
+    return unpack4x8unorm(pack4x8unorm(clamp(value, vec4(0.0), vec4(1.0))));
+}
+
 @vertex
 fn vertex_resolve(
     @builtin(vertex_index) vertex_index: u32,
@@ -67,6 +71,10 @@ fn fragment_resolve(in: VertexOutput) -> @location(0) vec4<f32> {
         } else {
             destination = source + destination * (1.0 - source.a);
         }
+        // cached_live_layers is an RGBA8 checkpoint. Preserve that same
+        // whole-stroke checkpoint between every concurrently live stroke so
+        // persistent replay produces the identical color after retirement.
+        destination = rgba8_checkpoint(destination);
     }
     return destination;
 }
