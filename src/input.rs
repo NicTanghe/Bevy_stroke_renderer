@@ -294,18 +294,19 @@ fn make_point(
         aspect_ratio: footprint.half_size.x / footprint.half_size.y,
         flow: footprint.flow,
         orientation: brush_orientation(data),
-        twist_radians: data
-            .twist
-            .map_or(0.0, |degrees| (degrees as f32).to_radians()),
+        twist_radians: brush_twist_radians(data),
     })
 }
 
 fn brush_tilt_degrees(data: &PenData) -> f32 {
-    if let Some(tilt) = data.tilt {
-        return Vec2::new(tilt.x as f32, tilt.y as f32).length();
+    if let Some(angle) = data.angle {
+        return (std::f64::consts::FRAC_PI_2 - angle.altitude).to_degrees() as f32;
     }
-    data.angle.map_or(0.0, |angle| {
-        (std::f64::consts::FRAC_PI_2 - angle.altitude).to_degrees() as f32
+    data.tilt.map_or(0.0, |tilt| {
+        tilt_surface_projection(tilt.x, tilt.y)
+            .length()
+            .atan()
+            .to_degrees()
     })
 }
 
@@ -325,17 +326,37 @@ fn brush_orientation(data: &PenData) -> Vec2 {
     if let Some(angle) = data.angle {
         let azimuth = angle.azimuth as f32;
         let (sin, cos) = ops::sin_cos(azimuth);
-        return Vec2::new(cos, sin);
+        // Winit azimuth increases clockwise in screen coordinates. Bevy's
+        // document space has positive Y upward, so screen Y must be mirrored.
+        return Vec2::new(cos, -sin);
     }
     if let Some(tilt) = data.tilt {
-        return Vec2::new(tilt.x as f32, tilt.y as f32).normalize_or(Vec2::Y);
+        return tilt_surface_projection(tilt.x, tilt.y).normalize_or(Vec2::Y);
     }
     Vec2::Y
+}
+
+fn tilt_surface_projection(x_degrees: i8, y_degrees: i8) -> Vec2 {
+    // Winit reports two plane angles, not the components of one angle vector.
+    // Their tangents are the projected tool-axis components on the tablet.
+    // Positive tablet Y is down-screen, while positive document Y is upward.
+    Vec2::new(
+        (x_degrees as f32).to_radians().tan(),
+        -(y_degrees as f32).to_radians().tan(),
+    )
+}
+
+fn brush_twist_radians(data: &PenData) -> f32 {
+    // Winit twist is clockwise; positive mathematical rotation in the stroke
+    // shaders is counter-clockwise in Bevy world coordinates.
+    data.twist
+        .map_or(0.0, |degrees| -(degrees as f32).to_radians())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_input::pen::{PenAngle, PenTilt};
 
     #[test]
     fn release_position_does_not_import_zero_pressure_footprint() {
@@ -355,5 +376,30 @@ mod tests {
         assert_eq!(released.flow, last_contact_point.flow);
         assert_eq!(released.orientation, last_contact_point.orientation);
         assert_eq!(released.twist_radians, last_contact_point.twist_radians);
+    }
+
+    #[test]
+    fn pen_angles_are_converted_from_screen_to_world_coordinates() {
+        let from_tilt = PenData {
+            tilt: Some(PenTilt { x: 30, y: 40 }),
+            ..Default::default()
+        };
+        let projected = Vec2::new(30.0_f32.to_radians().tan(), -40.0_f32.to_radians().tan());
+        assert!(brush_orientation(&from_tilt).abs_diff_eq(projected.normalize_or_zero(), 0.0001));
+        assert!(
+            (brush_tilt_degrees(&from_tilt) - projected.length().atan().to_degrees()).abs()
+                < 0.0001
+        );
+
+        let from_angle = PenData {
+            angle: Some(PenAngle {
+                altitude: core::f64::consts::FRAC_PI_4,
+                azimuth: core::f64::consts::FRAC_PI_2,
+            }),
+            twist: Some(90),
+            ..Default::default()
+        };
+        assert!(brush_orientation(&from_angle).abs_diff_eq(Vec2::NEG_Y, 0.0001));
+        assert!((brush_twist_radians(&from_angle) + core::f32::consts::FRAC_PI_2).abs() < 0.0001);
     }
 }

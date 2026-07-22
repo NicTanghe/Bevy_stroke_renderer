@@ -38,7 +38,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{
     layer_phase_sort_key, replace_buffer, GpuRgbaMaterial, GpuStrokePoint, GpuStrokeSegment,
-    StrokeGpuBuffers, TileCanvasRenderEntity,
+    QueuedLiveLayers, StrokeGpuBuffers, TileCanvasRenderEntity,
 };
 use crate::{
     tiles::{TileDisplayInstance, TileFeedback, TileRasterJob},
@@ -160,6 +160,7 @@ pub(super) fn extract_tile_batch(
         commands.spawn((
             Name::new(format!("HameronsTileCanvasLayer{}", first.key.layer.0)),
             TileCanvasRenderEntity {
+                layer: first.key.layer,
                 instances: start as u32..end as u32,
                 order: first.layer_order,
                 layer_count: first.layer_count,
@@ -204,7 +205,7 @@ pub(super) struct TileGpuCache {
     pixels: Option<Buffer>,
     pixel_capacity_slots: u32,
     compute_bind_group: Option<BindGroup>,
-    composite_bind_group: Option<BindGroup>,
+    pub(super) composite_bind_group: Option<BindGroup>,
     bind_groups_dirty: bool,
     job_count: u32,
     instance_count: u32,
@@ -338,9 +339,9 @@ pub(super) struct TileComputePipeline {
 
 #[derive(Clone, Resource)]
 pub(super) struct TileCompositePipeline {
-    mesh_pipeline: Mesh2dPipeline,
-    layout: BindGroupLayoutDescriptor,
-    shader: Handle<Shader>,
+    pub(super) mesh_pipeline: Mesh2dPipeline,
+    pub(super) layout: BindGroupLayoutDescriptor,
+    pub(super) shader: Handle<Shader>,
 }
 
 pub(super) fn init_tile_pipelines(
@@ -612,9 +613,10 @@ pub(super) fn queue_tile_canvas(
     pipeline_cache: Res<PipelineCache>,
     cache: Res<TileGpuCache>,
     extracted: Res<ExtractedTileBatch>,
+    queued_live_layers: Res<QueuedLiveLayers>,
     renderers: Query<(Entity, &MainEntity, &TileCanvasRenderEntity)>,
     mut phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
-    views: Query<(&ExtractedView, &Msaa), With<Camera2d>>,
+    views: Query<(Entity, &ExtractedView, &Msaa), With<Camera2d>>,
 ) {
     // Specialize for every active 2D view even while the canvas is empty. If
     // specialization only starts once the first completed tile is displayable,
@@ -628,7 +630,7 @@ pub(super) fn queue_tile_canvas(
             .expect("tile draw command was not registered")
     });
     let mut queued_for_presentation = false;
-    for (view, msaa) in &views {
+    for (view_entity, view, msaa) in &views {
         let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format);
         let pipeline_id: CachedRenderPipelineId = pipelines.specialize(
@@ -646,11 +648,17 @@ pub(super) fn queue_tile_canvas(
             continue;
         };
         for (render_entity, main_entity, renderer) in &renderers {
+            if queued_live_layers.contains(view_entity, renderer.layer) {
+                // The same cached tile range was drawn into the resolved live
+                // layer before the camera pass, so it was still presented.
+                queued_for_presentation = true;
+                continue;
+            }
             phase.add_transient(Transparent2d {
                 entity: (render_entity, *main_entity),
                 draw_function,
                 pipeline: pipeline_id,
-                sort_key: layer_phase_sort_key(renderer.order, renderer.layer_count, false),
+                sort_key: layer_phase_sort_key(renderer.order, renderer.layer_count),
                 batch_range: 0..1,
                 extra_index: PhaseItemExtraIndex::None,
                 extracted_index: usize::MAX,
@@ -679,8 +687,10 @@ mod tests {
 
     #[test]
     fn tile_shaders_parse_and_validate() {
-        let raster = include_str!("../shaders/tile_raster.wgsl");
-        let module = naga::front::wgsl::parse_str(raster).expect("tile raster shader must parse");
+        let raster = super::super::expand_stroke_geometry_for_test(include_str!(
+            "../shaders/tile_raster.wgsl"
+        ));
+        let module = naga::front::wgsl::parse_str(&raster).expect("tile raster shader must parse");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),

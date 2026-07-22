@@ -27,7 +27,6 @@ const MAX_DOCUMENT_BYTES: u64 = 512 * 1024 * 1024;
 const FORMAT_ID: &str = "org.hamerons.stroke-document";
 const KRITA_IMAGE_NAME: &str = "unnamed";
 const KRITA_TILE_SIZE: u32 = 64;
-const SMOOTH_JOIN_MIN_DOT: f32 = 0.75;
 const PAPER_SRGB: [u8; 4] = [248, 247, 244, 255];
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1367,16 +1366,6 @@ fn krita_point_major_axis(point: ArchivePoint) -> Vec2 {
     )
 }
 
-fn krita_ellipse_support_radius(point: ArchivePoint, axis: Vec2) -> f32 {
-    let minor_radius = point.half_width.max(0.0001);
-    let major_radius = minor_radius * point.aspect_ratio.max(1.0);
-    let major_axis = krita_point_major_axis(point);
-    let minor_axis = Vec2::new(-major_axis.y, major_axis.x);
-    let major_component = axis.dot(major_axis) * major_radius;
-    let minor_component = axis.dot(minor_axis) * minor_radius;
-    (major_component * major_component + minor_component * minor_component).sqrt()
-}
-
 fn krita_ellipse_amount(pixel: Vec2, point: ArchivePoint) -> f32 {
     let minor_radius = point.half_width.max(0.0001);
     let major_radius = minor_radius * point.aspect_ratio.max(1.0);
@@ -1393,26 +1382,61 @@ fn krita_ellipse_amount(pixel: Vec2, point: ArchivePoint) -> f32 {
     coverage * point.flow.clamp(0.0, 1.0)
 }
 
-fn krita_segment_tangent(segment: ArchiveSegment, points: &[ArchivePoint]) -> Vec2 {
-    let start = Vec2::from_array(points[segment.start as usize].position);
-    let end = Vec2::from_array(points[segment.end as usize].position);
-    (end - start).normalize_or_zero()
+fn krita_interpolate_ellipse_axis(from: Vec2, to: Vec2, amount: f32) -> Vec2 {
+    let from = from.normalize_or(Vec2::Y);
+    let mut to = to.normalize_or(from);
+    if from.dot(to) < 0.0 {
+        to = -to;
+    }
+    from.lerp(to, amount).normalize_or(from)
 }
 
-fn krita_join_tangent(incoming: Vec2, outgoing: Vec2) -> Vec2 {
-    if incoming.length_squared() <= 0.000_000_01 {
-        return outgoing;
+fn krita_interpolate_stroke_point(
+    from: ArchivePoint,
+    to: ArchivePoint,
+    amount: f32,
+) -> ArchivePoint {
+    let major_axis = krita_interpolate_ellipse_axis(
+        krita_point_major_axis(from),
+        krita_point_major_axis(to),
+        amount,
+    );
+    ArchivePoint {
+        position: Vec2::from_array(from.position)
+            .lerp(Vec2::from_array(to.position), amount)
+            .to_array(),
+        half_width: from.half_width.lerp(to.half_width, amount),
+        aspect_ratio: from.aspect_ratio.lerp(to.aspect_ratio, amount),
+        flow: from.flow.lerp(to.flow, amount),
+        orientation: major_axis.to_array(),
+        twist_radians: 0.0,
     }
-    if outgoing.length_squared() <= 0.000_000_01 {
-        return incoming;
-    }
-    (incoming + outgoing).normalize_or(outgoing)
 }
 
-fn krita_join_is_smooth(incoming: Vec2, outgoing: Vec2) -> bool {
-    incoming.length_squared() > 0.000_000_01
-        && outgoing.length_squared() > 0.000_000_01
-        && incoming.normalize().dot(outgoing.normalize()) >= SMOOTH_JOIN_MIN_DOT
+fn krita_ellipse_metric_projection(
+    pixel: Vec2,
+    origin: Vec2,
+    delta: Vec2,
+    point: ArchivePoint,
+) -> f32 {
+    let minor_radius = point.half_width.max(0.0001);
+    let major_radius = minor_radius * point.aspect_ratio.max(1.0);
+    let major_axis = krita_point_major_axis(point);
+    let minor_axis = Vec2::new(-major_axis.y, major_axis.x);
+    let offset = pixel - origin;
+    let metric_offset = Vec2::new(
+        offset.dot(major_axis) / major_radius,
+        offset.dot(minor_axis) / minor_radius,
+    );
+    let metric_delta = Vec2::new(
+        delta.dot(major_axis) / major_radius,
+        delta.dot(minor_axis) / minor_radius,
+    );
+    let denominator = metric_delta.length_squared();
+    if denominator <= 0.000_001 {
+        return 0.0;
+    }
+    metric_offset.dot(metric_delta) / denominator
 }
 
 fn krita_segment_body_amount(
@@ -1431,44 +1455,18 @@ fn krita_segment_body_amount(
     if length_squared <= 0.000_001 {
         return 0.0;
     }
-    let tangent = delta / length_squared.sqrt();
-    let mut start_tangent = tangent;
-    let mut end_tangent = tangent;
-    if segment_index > 0 {
-        let previous = segments[segment_index as usize - 1];
-        if previous.end == segment.start {
-            let incoming = krita_segment_tangent(previous, points);
-            if krita_join_is_smooth(incoming, tangent) {
-                start_tangent = krita_join_tangent(incoming, tangent);
-            }
-        }
+    let mut amount = ((pixel - position_a).dot(delta) / length_squared).clamp(0.0, 1.0);
+    for _ in 0..2 {
+        let point = krita_interpolate_stroke_point(point_a, point_b, amount);
+        amount = krita_ellipse_metric_projection(pixel, position_a, delta, point).clamp(0.0, 1.0);
     }
-    if let Some(next) = segments.get(segment_index as usize + 1)
-        && next.start == segment.end
-    {
-        let outgoing = krita_segment_tangent(*next, points);
-        if krita_join_is_smooth(tangent, outgoing) {
-            end_tangent = krita_join_tangent(tangent, outgoing);
-        }
-    }
-
-    if (pixel - position_a).dot(start_tangent) < 0.0 || (pixel - position_b).dot(end_tangent) > 0.0
-    {
+    if amount <= 0.0 || amount >= 1.0 {
         return 0.0;
     }
-
-    let amount = ((pixel - position_a).dot(delta) / length_squared).clamp(0.0, 1.0);
-    let start_normal = Vec2::new(-start_tangent.y, start_tangent.x);
-    let end_normal = Vec2::new(-end_tangent.y, end_tangent.x);
-    let normal = start_normal
-        .lerp(end_normal, amount)
-        .normalize_or(Vec2::new(-tangent.y, tangent.x));
-    let center = position_a.lerp(position_b, amount);
-    let support_radius = krita_ellipse_support_radius(point_a, start_normal)
-        .lerp(krita_ellipse_support_radius(point_b, end_normal), amount);
-    let signed_distance = (pixel - center).dot(normal).abs() - support_radius;
-    let coverage = (0.5 - signed_distance).clamp(0.0, 1.0);
-    coverage * point_a.flow.lerp(point_b.flow, amount).clamp(0.0, 1.0)
+    krita_ellipse_amount(
+        pixel,
+        krita_interpolate_stroke_point(point_a, point_b, amount),
+    )
 }
 
 fn krita_segment_cap_amount(
@@ -1478,30 +1476,7 @@ fn krita_segment_cap_amount(
     points: &[ArchivePoint],
 ) -> f32 {
     let segment = segments[segment_index as usize];
-    let point = points[segment.end as usize];
-    let position = Vec2::from_array(point.position);
-    let offset = pixel - position;
-    let incoming_delta = position - Vec2::from_array(points[segment.start as usize].position);
-    let outgoing_delta = segments
-        .get(segment_index as usize + 1)
-        .filter(|next| next.start == segment.end)
-        .map_or(Vec2::ZERO, |next| {
-            Vec2::from_array(points[next.end as usize].position) - position
-        });
-    let has_incoming = incoming_delta.length() > 0.0001;
-    let has_outgoing = outgoing_delta.length() > 0.0001;
-
-    if has_incoming && has_outgoing && krita_join_is_smooth(incoming_delta, outgoing_delta) {
-        return 0.0;
-    }
-    if has_incoming && offset.dot(incoming_delta.normalize_or_zero()) <= 0.0 {
-        return 0.0;
-    }
-    if has_outgoing && offset.dot(outgoing_delta.normalize_or_zero()) >= 0.0 {
-        return 0.0;
-    }
-
-    krita_ellipse_amount(pixel, point)
+    krita_ellipse_amount(pixel, points[segment.end as usize])
 }
 
 fn paint_device_bytes(tiles: &BTreeMap<(u32, u32), Vec<[f32; 4]>>) -> Vec<u8> {
@@ -1722,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn raster_geometry_smooths_gentle_joins_and_bounds_sharp_ones() {
+    fn raster_geometry_sweeps_ellipses_without_join_spurs() {
         let segment = ArchiveSegment {
             start: 0,
             end: 1,
@@ -1750,17 +1725,7 @@ mod tests {
         );
         assert_eq!(
             krita_segment_cap_amount(Vec2::new(10.0, 2.0), 0, &straight_segments, &straight),
-            0.0
-        );
-
-        let gentle = [
-            raster_point(0.0, 0.0),
-            raster_point(10.0, 0.0),
-            raster_point(20.0, 2.0),
-        ];
-        assert_eq!(
-            krita_segment_cap_amount(Vec2::new(10.0, -2.0), 0, &straight_segments, &gentle),
-            0.0
+            0.25
         );
 
         let corner = [
@@ -1779,6 +1744,35 @@ mod tests {
         assert_eq!(
             krita_segment_cap_amount(Vec2::new(30.0, -20.0), 0, &straight_segments, &corner),
             0.0
+        );
+
+        let tilted_point = |x| ArchivePoint {
+            position: [x, 0.0],
+            half_width: 2.0,
+            aspect_ratio: 5.0,
+            flow: 0.25,
+            orientation: Vec2::from_angle(core::f32::consts::FRAC_PI_4).to_array(),
+            twist_radians: 0.0,
+        };
+        let tilted = [tilted_point(0.0), tilted_point(20.0)];
+        let tilted_segments = [ArchiveSegment {
+            start: 0,
+            end: 1,
+            ..Default::default()
+        }];
+
+        // A rotated ellipse's upper support point is shifted along the path.
+        // Treating the support radius as a purely vertical radius used to
+        // cover this pixel and create a triangular point at every join.
+        let old_spur = Vec2::new(0.0, 6.5);
+        assert_eq!(
+            krita_segment_body_amount(old_spur, 0, &tilted_segments, &tilted).max(
+                krita_segment_cap_amount(old_spur, 0, &tilted_segments, &tilted)
+            ),
+            0.0
+        );
+        assert!(
+            krita_segment_body_amount(Vec2::new(10.0, 6.5), 0, &tilted_segments, &tilted,) > 0.15
         );
     }
 

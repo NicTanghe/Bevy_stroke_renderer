@@ -55,3 +55,11 @@ fn fragment_tile(in: VertexOutput) -> @location(0) vec4<f32> {
     let index = in.slot * size * size + pixel.y * size + pixel.x;
     return unpack4x8unorm(tile_pixels[index]) * in.opacity;
 }
+
+@fragment
+fn fragment_tile_unscaled(in: VertexOutput) -> @location(0) vec4<f32> {
+    let size = in.tile_size;
+    let pixel = min(vec2<u32>(in.local * f32(size)), vec2(size - 1u));
+    let index = in.slot * size * size + pixel.y * size + pixel.x;
+    return unpack4x8unorm(tile_pixels[index]);
+}

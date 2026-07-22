@@ -35,6 +35,7 @@ use bevy_app::{App, Plugin, PostUpdate, PreUpdate, Startup, Update};
 use bevy_asset::embedded_asset;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_input::InputSystems;
+use bevy_shader::load_shader_library;
 
 use diagnostics::log_stroke_diagnostics;
 use input::{collect_pen_strokes, PenContacts};
@@ -68,7 +69,10 @@ pub struct StrokeRenderPlugin;
 
 impl Plugin for StrokeRenderPlugin {
     fn build(&self, app: &mut App) {
+        load_shader_library!(app, "shaders/stroke_geometry.wgsl");
         embedded_asset!(app, "shaders/stroke_coverage.wgsl");
+        embedded_asset!(app, "shaders/stroke_composite.wgsl");
+        embedded_asset!(app, "shaders/stroke_layer_resolve.wgsl");
         embedded_asset!(app, "shaders/tile_raster.wgsl");
         embedded_asset!(app, "shaders/tile_composite.wgsl");
         app.init_resource::<RgbaPaintModel>()
